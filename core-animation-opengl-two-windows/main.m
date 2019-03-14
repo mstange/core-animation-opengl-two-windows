@@ -44,7 +44,7 @@ static NSOpenGLContext* MakeOffscreenGLContext();
 - (IOSurfaceRef)surface;
 @end
 
-@interface TestView: NSView
+@interface TestView: NSView<CALayerDelegate>
 {
     IOSurfaceContentsDrawerUsingOpenGL* drawer_;
     uint64_t frameCounter_;
@@ -60,9 +60,11 @@ static NSOpenGLContext* MakeOffscreenGLContext();
     
     frameCounter_ = 0;
     
+    self.layer = [CALayer layer];
     self.wantsLayer = YES;
+    self.layer.delegate = self;
     CALayer* colorLayer = [CALayer layer];
-    colorLayer.backgroundColor = [[NSColor colorWithDeviceRed:0.0 green:0.0 blue:1.0 alpha:1.0] CGColor];
+    colorLayer.backgroundColor = [[NSColor colorWithDeviceRed:0.0 green:0.8 blue:0.0 alpha:1.0] CGColor];
     colorLayer.position = NSZeroPoint;
     colorLayer.anchorPoint = NSZeroPoint;
     colorLayer.bounds = NSMakeRect(0, 0, 10, 5);
@@ -84,12 +86,7 @@ static NSOpenGLContext* MakeOffscreenGLContext();
     [super dealloc];
 }
 
-- (BOOL)wantsUpdateLayer
-{
-    return YES;
-}
-
-- (void)updateLayer
+- (void)displayLayer:(CALayer *)layer
 {
     
     //     NSLog(@"updateLayer in window %@", [self window]);
@@ -100,7 +97,7 @@ static NSOpenGLContext* MakeOffscreenGLContext();
     [self.layer setContentsChanged];
     self.layer.sublayerTransform = CATransform3DMakeAffineTransform(CGAffineTransformTranslate(CGAffineTransformMakeScale(1.0f, -1.0f), 0, -self.bounds.size.height));
     [CATransaction setDisableActions:YES];
-    self.layer.sublayers.firstObject.position = NSMakePoint(160 + (frameCounter_ % 15) * 10, 0);
+    self.layer.sublayers.firstObject.position = NSMakePoint(640 + (frameCounter_ % 60) * 10, 0);
     [CATransaction setDisableActions:NO];
     
     frameCounter_++;
@@ -470,7 +467,7 @@ static const char* kFragmentShader =
     glScissor(0, 0, width, 10);
     glClearColor(0.9, 0.9, 0.9, 1.0);
     glClear(GL_COLOR_BUFFER_BIT);
-    glScissor((frameCounter_ % 15) * 20, 0, 20, 10);
+    glScissor((frameCounter_ % 60) * 20, 0, 20, 10);
     glClearColor(0, 0, 0.8, 1.0);
     glClear(GL_COLOR_BUFFER_BIT);
     glDisable(GL_SCISSOR_TEST);
