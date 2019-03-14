@@ -7,18 +7,13 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		DFA8A0DC22398A5300331EF9 /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = DFA8A0DB22398A5300331EF9 /* AppDelegate.m */; };
 		DFA8A0DE22398A5300331EF9 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = DFA8A0DD22398A5300331EF9 /* Assets.xcassets */; };
-		DFA8A0E122398A5300331EF9 /* MainMenu.xib in Resources */ = {isa = PBXBuildFile; fileRef = DFA8A0DF22398A5300331EF9 /* MainMenu.xib */; };
 		DFA8A0E422398A5300331EF9 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = DFA8A0E322398A5300331EF9 /* main.m */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		DFA8A0D722398A5300331EF9 /* core-animation-opengl-two-windows.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "core-animation-opengl-two-windows.app"; sourceTree = BUILT_PRODUCTS_DIR; };
-		DFA8A0DA22398A5300331EF9 /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
-		DFA8A0DB22398A5300331EF9 /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppDelegate.m; sourceTree = "<group>"; };
 		DFA8A0DD22398A5300331EF9 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		DFA8A0E022398A5300331EF9 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.xib; name = Base; path = Base.lproj/MainMenu.xib; sourceTree = "<group>"; };
 		DFA8A0E222398A5300331EF9 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		DFA8A0E322398A5300331EF9 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
 		DFA8A0E522398A5300331EF9 /* core_animation_opengl_two_windows.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = core_animation_opengl_two_windows.entitlements; sourceTree = "<group>"; };
@@ -54,10 +49,7 @@
 		DFA8A0D922398A5300331EF9 /* core-animation-opengl-two-windows */ = {
 			isa = PBXGroup;
 			children = (
-				DFA8A0DA22398A5300331EF9 /* AppDelegate.h */,
-				DFA8A0DB22398A5300331EF9 /* AppDelegate.m */,
 				DFA8A0DD22398A5300331EF9 /* Assets.xcassets */,
-				DFA8A0DF22398A5300331EF9 /* MainMenu.xib */,
 				DFA8A0E222398A5300331EF9 /* Info.plist */,
 				DFA8A0E322398A5300331EF9 /* main.m */,
 				DFA8A0E522398A5300331EF9 /* core_animation_opengl_two_windows.entitlements */,
@@ -124,7 +116,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				DFA8A0DE22398A5300331EF9 /* Assets.xcassets in Resources */,
-				DFA8A0E122398A5300331EF9 /* MainMenu.xib in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -136,22 +127,10 @@
 			buildActionMask = 2147483647;
 			files = (
 				DFA8A0E422398A5300331EF9 /* main.m in Sources */,
-				DFA8A0DC22398A5300331EF9 /* AppDelegate.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
-
-/* Begin PBXVariantGroup section */
-		DFA8A0DF22398A5300331EF9 /* MainMenu.xib */ = {
-			isa = PBXVariantGroup;
-			children = (
-				DFA8A0E022398A5300331EF9 /* Base */,
-			);
-			name = MainMenu.xib;
-			sourceTree = "<group>";
-		};
-/* End PBXVariantGroup section */
 
 /* Begin XCBuildConfiguration section */
 		DFA8A0E622398A5300331EF9 /* Debug */ = {
@@ -261,6 +240,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_OBJC_ARC = NO;
 				CODE_SIGN_ENTITLEMENTS = "core-animation-opengl-two-windows/core_animation_opengl_two_windows.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
@@ -275,6 +255,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_OBJC_ARC = NO;
 				CODE_SIGN_ENTITLEMENTS = "core-animation-opengl-two-windows/core_animation_opengl_two_windows.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
