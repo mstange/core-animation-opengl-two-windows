@@ -38,9 +38,12 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     NSOpenGLContext* glContext_;
     OpenGLDrawer* glDrawer_;
     NSMutableDictionary<NSNumber*, NSDictionary<NSString*, NSNumber*>*>* mRegisteredIOSurfaces;
+    GLuint mPreviousFrameDoneFence;
+    GLuint mCurrentFrameDoneFence;
 }
 - (id)initWithContext:(NSOpenGLContext*)context;
 - (void)drawIntoSurface:(IOSurface*)surface;
+- (void)markFrameDoneAndApplyBackpressure:(BOOL)shouldApplyBackpressure;
 @end
 
 @class IOSurface;
@@ -81,7 +84,6 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
 // - (NSRect)currentSurfaceInvalidRect;
 // - (NSRect)opaqueRect;
 - (void)notifySurfaceReadyForUse;
-- (BOOL)hasReadySurface;
 
 @end
 
@@ -91,6 +93,9 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     uint64_t frameCounter_;
     CAIOSurfaceLayer* contentLayer_;
 }
+
+- (void)updateDrawing;
+- (void)markFrameDoneAndApplyBackpressure:(BOOL)shouldApplyBackpressure;
 
 @end
 
@@ -113,10 +118,6 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     contentLayer_.position = NSZeroPoint;
     contentLayer_.anchorPoint = NSZeroPoint;
     contentLayer_.bounds = self.bounds;
-    NSSize backingSize = [self convertSizeToBacking:self.bounds.size];
-    IOSurface* surface = [contentLayer_ takeNextSurfaceWithWidth:(int)backingSize.width height:(int)backingSize.height];
-    [drawer_ drawIntoSurface:surface];
-    [contentLayer_ notifySurfaceReadyForUse];
     [self.layer addSublayer:contentLayer_];
     
     CALayer* colorLayer = [CALayer layer];
@@ -136,21 +137,25 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     [super dealloc];
 }
 
+- (void)updateDrawing
+{
+    @synchronized (self) {
+        NSSize backingSize = [self convertSizeToBacking:self.bounds.size];
+        IOSurface* surface = [contentLayer_ takeNextSurfaceWithWidth:(int)backingSize.width height:(int)backingSize.height];
+        [drawer_ drawIntoSurface:surface];
+        [contentLayer_ notifySurfaceReadyForUse];
+    }
+}
+
+- (void)markFrameDoneAndApplyBackpressure:(BOOL)shouldApplyBackpressure
+{
+    [drawer_ markFrameDoneAndApplyBackpressure:shouldApplyBackpressure];
+}
+
 - (void)displayLayer:(CALayer *)layer
 {
-    
     //     NSLog(@"updateLayer in window %@", [self window]);
     [contentLayer_ setNeedsDisplay];
-    @synchronized(self) {
-        if (![contentLayer_ hasReadySurface]) {
-            NSSize backingSize = [self convertSizeToBacking:self.bounds.size];
-            IOSurface* surface = [contentLayer_ takeNextSurfaceWithWidth:(int)backingSize.width height:(int)backingSize.height];
-            if (surface) {
-                [drawer_ drawIntoSurface:surface];
-                [contentLayer_ notifySurfaceReadyForUse];
-            }
-        }
-    }
     [CATransaction setDisableActions:YES];
     contentLayer_.bounds = self.bounds;
     self.layer.sublayers.lastObject.position = NSMakePoint(640 + (frameCounter_ % 60) * 10, self.bounds.size.height - 5);
@@ -227,11 +232,17 @@ static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTime
 - (void)tick
 {
     // NSLog(@"tick");
-    [CATransaction begin];
     for (TestView* view in mViews) {
-        [view setNeedsDisplay:YES];
+        [view updateDrawing];
     }
-    [CATransaction commit];
+    for (TestView* view in mViews) {
+        [CATransaction begin];
+        [view setNeedsDisplay:YES];
+        [CATransaction commit];
+    }
+    for (TestView* view in mViews) {
+        [view markFrameDoneAndApplyBackpressure:YES];
+    }
 }
 
 @end
@@ -615,10 +626,14 @@ MakeOffscreenGLContext()
     self = [super init];
     
     mRegisteredIOSurfaces = [[NSMutableDictionary dictionaryWithCapacity:10] retain];
+    mPreviousFrameDoneFence = 0;
+    mCurrentFrameDoneFence = 0;
     glContext_ = [context retain];
     CGLLockContext([glContext_ CGLContextObj]);
     [glContext_ makeCurrentContext];
     glDrawer_ = [[OpenGLDrawer alloc] init];
+    glGenFencesAPPLE(1, &mPreviousFrameDoneFence);
+    glGenFencesAPPLE(1, &mCurrentFrameDoneFence);
     [NSOpenGLContext clearCurrentContext];
     CGLUnlockContext([glContext_ CGLContextObj]);
     
@@ -629,6 +644,8 @@ MakeOffscreenGLContext()
 {
     CGLLockContext([glContext_ CGLContextObj]);
     [glContext_ makeCurrentContext];
+    glDeleteFencesAPPLE(1, &mPreviousFrameDoneFence);
+    glDeleteFencesAPPLE(1, &mCurrentFrameDoneFence);
     // TODO: unregister iosurfaces
     [mRegisteredIOSurfaces release];
     [glDrawer_ release];
@@ -636,6 +653,28 @@ MakeOffscreenGLContext()
     CGLUnlockContext([glContext_ CGLContextObj]);
     [glContext_ release];
     [super dealloc];
+}
+
+- (void)markFrameDoneAndApplyBackpressure:(BOOL)shouldApplyBackpressure
+{
+    CGLLockContext([glContext_ CGLContextObj]);
+    [glContext_ makeCurrentContext];
+    
+    glSetFenceAPPLE(mCurrentFrameDoneFence);
+    
+    if (shouldApplyBackpressure) {
+        glFinishFenceAPPLE(mPreviousFrameDoneFence);
+    }
+    
+    // mPreviousFrameDoneFence is now status TRUE. Reuse the fence object for the next frame.
+    GLuint nextFrameDoneFence = mPreviousFrameDoneFence;
+    
+    // Prepare for the next frame.
+    mPreviousFrameDoneFence = mCurrentFrameDoneFence;
+    mCurrentFrameDoneFence = nextFrameDoneFence;
+    
+    [NSOpenGLContext clearCurrentContext];
+    CGLUnlockContext([glContext_ CGLContextObj]);
 }
 
 static float CurrentAngle() { return fmod(CFAbsoluteTimeGetCurrent(), 1.0) * 360; }
@@ -726,53 +765,54 @@ static float CurrentAngle() { return fmod(CFAbsoluteTimeGetCurrent(), 1.0) * 360
 }
 
 - (IOSurface*)takeNextSurfaceWithWidth:(NSInteger)width height:(NSInteger)height {
-    if (mCurrentSurface) {
-        abort();
-    }
-    
-    IOSurface* surf = [[mSurfaces firstObject] retain];
-    if (surf) {
-        // Check if we can reuse surf. If the size has changed, throw the old
-        // one out. If it is still in use (usually by the window server), keep
-        // it in the queue because it will likely become unused soon.
-        if ([surf width] != width || [surf height] != height) {
-            [mSurfaces removeObjectAtIndex:0];
-            [mIOSurfaceProvider returnSurface:surf];
-            [surf release];
-            surf = nil;
-        } else if ([surf isInUse]) {
-            [surf release];
-            surf = nil;
-        } else {
-            [mSurfaces removeObjectAtIndex:0];
-//            NSLog(@"reusing surface");
+    @synchronized (self) {
+        if (mCurrentSurface) {
+            NSLog(@"ERROR: surface already in use. Please trigger a CATransaction before taking the next one.");
+            abort();
         }
+        
+        IOSurface* surf = [[mSurfaces firstObject] retain];
+        if (surf) {
+            // Check if we can reuse surf. If the size has changed, throw the old
+            // one out. If it is still in use (usually by the window server), keep
+            // it in the queue because it will likely become unused soon.
+            if ([surf width] != width || [surf height] != height) {
+                [mSurfaces removeObjectAtIndex:0];
+                [mIOSurfaceProvider returnSurface:surf];
+                [surf release];
+                surf = nil;
+            } else if ([surf isInUse]) {
+                [surf release];
+                surf = nil;
+            } else {
+                [mSurfaces removeObjectAtIndex:0];
+    //            NSLog(@"reusing surface");
+            }
+        }
+        if (!surf) {
+    //        NSLog(@"allocating new surface");
+            surf = [[mIOSurfaceProvider surfaceWithWidth:width height:height] retain];
+        }
+        if (!surf) {
+    //        NSLog(@"surface allocation failed!");
+            return nil;
+        }
+        mCurrentSurface = [surf retain];
+        [mCurrentSurface incrementUseCount];
+        mCurrentSurfaceIsReadyForUse = NO;
+        [surf release];
+        surf = nil;
+        return mCurrentSurface;
     }
-    if (!surf) {
-//        NSLog(@"allocating new surface");
-        surf = [[mIOSurfaceProvider surfaceWithWidth:width height:height] retain];
-    }
-    if (!surf) {
-//        NSLog(@"surface allocation failed!");
-        return nil;
-    }
-    mCurrentSurface = [surf retain];
-    [mCurrentSurface incrementUseCount];
-    mCurrentSurfaceIsReadyForUse = NO;
-    [surf release];
-    surf = nil;
-    return mCurrentSurface;
 }
 
 - (void)notifySurfaceReadyForUse {
-    if (!mCurrentSurface) {
-        abort();
+    @synchronized (self) {
+        if (!mCurrentSurface) {
+            abort();
+        }
+        mCurrentSurfaceIsReadyForUse = YES;
     }
-    mCurrentSurfaceIsReadyForUse = YES;
-}
-
-- (BOOL)hasReadySurface {
-    return mCurrentSurface && mCurrentSurfaceIsReadyForUse;
 }
 
 - (void)display {
