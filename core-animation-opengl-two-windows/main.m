@@ -7,7 +7,7 @@
 #import <IOSurface/IOSurfaceObjC.h>
 #import <OpenGL/gl.h>
 
-static NSOpenGLContext* MakeOffscreenGLContext();
+static NSOpenGLContext* MakeOffscreenGLContext(void);
 
 @interface OpenGLDrawer : NSObject
 {
@@ -28,26 +28,68 @@ static NSOpenGLContext* MakeOffscreenGLContext();
 
 @end
 
-@interface IOSurfaceContentsDrawerUsingOpenGL : NSObject
+@protocol IOSurfaceProvider
+- (IOSurface*)surfaceWithWidth:(NSInteger)width height:(NSInteger)height;
+- (void)returnSurface:(IOSurface*)surface;
+@end
+
+@interface IOSurfaceContentsDrawerUsingOpenGL : NSObject<IOSurfaceProvider>
 {
     NSOpenGLContext* glContext_;
     OpenGLDrawer* glDrawer_;
-    int width_;
-    int height_;
-    
-    IOSurfaceRef surf_;
-    GLuint surftex_;
-    GLuint surffbo_;
+    NSMutableDictionary<NSNumber*, NSDictionary<NSString*, NSNumber*>*>* mRegisteredIOSurfaces;
 }
-- (id)init;
-- (void)drawWithSize:(NSSize)size;
-- (IOSurfaceRef)surface;
+- (id)initWithContext:(NSOpenGLContext*)context;
+- (void)drawIntoSurface:(IOSurface*)surface;
+@end
+
+@class IOSurface;
+
+// A CAIOSurfaceLayer is CALayer subclass which wraps a "swapchain" of IOSurfaces.
+// It supports setting an opaque region and it keeps track of invalid areas
+// within the surfaces.
+// Internally, it is assembled of one or more sublayers, depending on the
+// opaque region: Regular CALayers only support a per-layer "is opaque" setting,
+// so CASurfaceLayer creates layers for the opaque and transparent rectangles
+// that together form the full layer. All sublayers share the same IOSurface.
+// Submitting a new frame updates all sublayers.
+@interface CAIOSurfaceLayer : CALayer {
+    NSObject<IOSurfaceProvider>* mIOSurfaceProvider; // [strong]
+    
+    // The surface we returned from the most recent call to takeNextSurfaceWithWidth:height.
+    // Can be null if notifySurfaceReadyForUse has been called.
+    IOSurface* mCurrentSurface; // [strong]
+    
+    // Whether we're ready to submit mCurrentSurface during the next call to
+    // display. Meaningless as long as mCurrentSurface is null.
+    BOOL mCurrentSurfaceIsReadyForUse;
+    
+    // Really, it's a state machine:
+    // NoCurrentSurface -[takeNextSurface]-> CurrentSurfaceButNotReady
+    // -[notifySurfaceReadyForUse]-> CurrentSurfaceReady -[display]-> NoCurrentSurface
+    
+    // The queue of surfaces which make up our "swap chain".
+    // [mSurfaces firstObject] is the next surface we'll attempt to use.
+    // [mSurfaces lastObject] is the one we submitted most recently.
+    NSMutableArray<IOSurface*>* mSurfaces; // [strong]
+}
+
+- (id)initWithIOSurfaceProvider:(NSObject<IOSurfaceProvider>*)provider;
++ (CAIOSurfaceLayer*)layerWithIOSurfaceProvider:(NSObject<IOSurfaceProvider>*)provider;
+// - (void)invalidateRectThroughoutSwapchain:(NSRect)aRect;
+- (IOSurface*)takeNextSurfaceWithWidth:(NSInteger)width height:(NSInteger)height;
+// - (NSRect)currentSurfaceInvalidRect;
+// - (NSRect)opaqueRect;
+- (void)notifySurfaceReadyForUse;
+- (BOOL)hasReadySurface;
+
 @end
 
 @interface TestView: NSView<CALayerDelegate>
 {
     IOSurfaceContentsDrawerUsingOpenGL* drawer_;
     uint64_t frameCounter_;
+    CAIOSurfaceLayer* contentLayer_;
 }
 
 @end
@@ -63,6 +105,20 @@ static NSOpenGLContext* MakeOffscreenGLContext();
     self.layer = [CALayer layer];
     self.wantsLayer = YES;
     self.layer.delegate = self;
+    self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawDuringViewResize;
+    
+    drawer_ = [[IOSurfaceContentsDrawerUsingOpenGL alloc] initWithContext:MakeOffscreenGLContext()];
+    
+    contentLayer_ = [[CAIOSurfaceLayer layerWithIOSurfaceProvider:drawer_] retain];
+    contentLayer_.position = NSZeroPoint;
+    contentLayer_.anchorPoint = NSZeroPoint;
+    contentLayer_.bounds = self.bounds;
+    NSSize backingSize = [self convertSizeToBacking:self.bounds.size];
+    IOSurface* surface = [contentLayer_ takeNextSurfaceWithWidth:(int)backingSize.width height:(int)backingSize.height];
+    [drawer_ drawIntoSurface:surface];
+    [contentLayer_ notifySurfaceReadyForUse];
+    [self.layer addSublayer:contentLayer_];
+    
     CALayer* colorLayer = [CALayer layer];
     colorLayer.backgroundColor = [[NSColor colorWithDeviceRed:0.0 green:0.8 blue:0.0 alpha:1.0] CGColor];
     colorLayer.position = NSZeroPoint;
@@ -70,18 +126,12 @@ static NSOpenGLContext* MakeOffscreenGLContext();
     colorLayer.bounds = NSMakeRect(0, 0, 10, 5);
     colorLayer.zPosition = 1.0;
     [self.layer addSublayer:colorLayer];
-    self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawDuringViewResize;
-    
-    drawer_ = [[IOSurfaceContentsDrawerUsingOpenGL alloc] initWithContext:MakeOffscreenGLContext()];
-    NSSize backingSize = [self convertSizeToBacking:self.bounds.size];
-    // NSLog(@"updateLayer in window %@", [self window]);
-    [drawer_ drawWithSize:backingSize];
-    
     return self;
 }
 
 - (void)dealloc
 {
+    [contentLayer_ release];
     [drawer_ release];
     [super dealloc];
 }
@@ -90,14 +140,20 @@ static NSOpenGLContext* MakeOffscreenGLContext();
 {
     
     //     NSLog(@"updateLayer in window %@", [self window]);
-    NSSize backingSize = [self convertSizeToBacking:self.bounds.size];
-    [drawer_ drawWithSize:backingSize];
-    self.layer.contents = (id)[drawer_ surface];
-//    [self.layer setContentsOpaque:YES];
-    [self.layer setContentsChanged];
-    self.layer.sublayerTransform = CATransform3DMakeAffineTransform(CGAffineTransformTranslate(CGAffineTransformMakeScale(1.0f, -1.0f), 0, -self.bounds.size.height));
+    [contentLayer_ setNeedsDisplay];
+    @synchronized(self) {
+        if (![contentLayer_ hasReadySurface]) {
+            NSSize backingSize = [self convertSizeToBacking:self.bounds.size];
+            IOSurface* surface = [contentLayer_ takeNextSurfaceWithWidth:(int)backingSize.width height:(int)backingSize.height];
+            if (surface) {
+                [drawer_ drawIntoSurface:surface];
+                [contentLayer_ notifySurfaceReadyForUse];
+            }
+        }
+    }
     [CATransaction setDisableActions:YES];
-    self.layer.sublayers.firstObject.position = NSMakePoint(640 + (frameCounter_ % 60) * 10, 0);
+    contentLayer_.bounds = self.bounds;
+    self.layer.sublayers.lastObject.position = NSMakePoint(640 + (frameCounter_ % 60) * 10, self.bounds.size.height - 5);
     [CATransaction setDisableActions:NO];
     
     frameCounter_++;
@@ -187,7 +243,7 @@ main (int argc, char **argv)
     
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-    
+    [[NSUserDefaults standardUserDefaults] registerDefaults:@{ @"NSApplicationCrashOnExceptions": @YES }];
     int style =
     NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
     NSRect contentRect1 = NSMakeRect(100, 100, 800, 500);
@@ -498,7 +554,7 @@ CreateTransparentIOSurface(int aWidth, int aHeight)
                            //(NSString*)kIOSurfaceIsGlobal: [NSNumber numberWithBool:YES]
                            };
     IOSurfaceRef surf = IOSurfaceCreate((CFDictionaryRef)dict);
-    NSLog(@"IOSurface: %@", surf);
+//    NSLog(@"IOSurface: %@", surf);
     
     return surf;
 }
@@ -558,11 +614,7 @@ MakeOffscreenGLContext()
 {
     self = [super init];
     
-    width_ = 0;
-    height_ = 0;
-    surf_ = NULL;
-    surftex_ = 0;
-    surffbo_ = 0;
+    mRegisteredIOSurfaces = [[NSMutableDictionary dictionaryWithCapacity:10] retain];
     glContext_ = [context retain];
     CGLLockContext([glContext_ CGLContextObj]);
     [glContext_ makeCurrentContext];
@@ -577,6 +629,8 @@ MakeOffscreenGLContext()
 {
     CGLLockContext([glContext_ CGLContextObj]);
     [glContext_ makeCurrentContext];
+    // TODO: unregister iosurfaces
+    [mRegisteredIOSurfaces release];
     [glDrawer_ release];
     [NSOpenGLContext clearCurrentContext];
     CGLUnlockContext([glContext_ CGLContextObj]);
@@ -584,47 +638,154 @@ MakeOffscreenGLContext()
     [super dealloc];
 }
 
-// glContext_ needs to be current when this is called
-- (void)reinitForSizeChange
-{
-    if (surffbo_) {
-        glDeleteFramebuffers(1, &surffbo_);
-        surffbo_ = 0;
-    }
-    if (surftex_) {
-        glDeleteTextures(1, &surftex_);
-        surftex_ = 0;
-    }
-    if (surf_) {
-        CFRelease(surf_);
-        surf_ = NULL;
-    }
-    surf_ = CreateTransparentIOSurface(width_, height_);
-    surftex_ = CreateTextureForIOSurface([glContext_ CGLContextObj], surf_);
-    surffbo_ = CreateFBOForTexture(surftex_);
-    NSLog(@"have surf_ %p surftex_ %d surffbo_ %d", surf_, surftex_, surffbo_);
-}
-
 static float CurrentAngle() { return fmod(CFAbsoluteTimeGetCurrent(), 1.0) * 360; }
 
-- (void)drawWithSize:(NSSize)size
+- (void)drawIntoSurface:(IOSurface*)surface
 {
+    NSDictionary<NSString*, NSNumber*>* props = [mRegisteredIOSurfaces objectForKey:[NSNumber numberWithUnsignedInteger:(uintptr_t)surface]];
+    GLuint surffbo = [[props objectForKey:@"fbo"] unsignedIntValue];
     CGLLockContext([glContext_ CGLContextObj]);
     [glContext_ makeCurrentContext];
-    if (width_ != (int)size.width || height_ != (int)size.height) {
-        width_ = (int)size.width;
-        height_ = (int)size.height;
-        [self reinitForSizeChange];
-    }
-    [glDrawer_ drawToFBO:surffbo_ width:width_ height:height_ angle:CurrentAngle()];
+    [glDrawer_ drawToFBO:surffbo width:(int)[surface width] height:(int)[surface height] angle:CurrentAngle()];
     glFlush();
     [NSOpenGLContext clearCurrentContext];
     CGLUnlockContext([glContext_ CGLContextObj]);
 }
 
-- (IOSurfaceRef)surface
+- (void)returnSurface:(IOSurface *)surface {
+    CGLLockContext([glContext_ CGLContextObj]);
+    [glContext_ makeCurrentContext];
+    NSDictionary<NSString*, NSNumber*>* props = [mRegisteredIOSurfaces objectForKey:[NSNumber numberWithUnsignedInteger:(uintptr_t)surface]];
+    
+    GLuint surffbo = [[props objectForKey:@"fbo"] unsignedIntValue];
+    if (surffbo) {
+        glDeleteFramebuffers(1, &surffbo);
+        surffbo = 0;
+    }
+    GLuint surftex = [[props objectForKey:@"tex"] unsignedIntValue];
+    if (surftex) {
+        glDeleteTextures(1, &surftex);
+        surftex = 0;
+    }
+    [mRegisteredIOSurfaces removeObjectForKey:[NSNumber numberWithUnsignedInteger:(uintptr_t)surface]];
+    
+    [NSOpenGLContext clearCurrentContext];
+    CGLUnlockContext([glContext_ CGLContextObj]);
+}
+
+- (IOSurface *)surfaceWithWidth:(NSInteger)width height:(NSInteger)height {
+    IOSurfaceRef surf = CreateTransparentIOSurface((int)width, (int)height);
+    CGLLockContext([glContext_ CGLContextObj]);
+    [glContext_ makeCurrentContext];
+    GLuint surftex = CreateTextureForIOSurface([glContext_ CGLContextObj], surf);
+    GLuint surffbo = CreateFBOForTexture(surftex);
+    NSLog(@"have surf %p surftex %d surffbo %d", surf, surftex, surffbo);
+    [NSOpenGLContext clearCurrentContext];
+    CGLUnlockContext([glContext_ CGLContextObj]);
+    
+    [mRegisteredIOSurfaces setObject:@{ @"tex": [NSNumber numberWithUnsignedInteger:surftex], @"fbo": [NSNumber numberWithUnsignedInteger:surffbo]} forKey:[NSNumber numberWithUnsignedInteger:(uintptr_t)surf]];
+    
+    return [(id)surf autorelease];
+}
+
+@end
+
+
+@implementation CAIOSurfaceLayer
+
+- (id)initWithIOSurfaceProvider:(NSObject<IOSurfaceProvider>*)provider {
+    self = [super init];
+    
+    mIOSurfaceProvider = [provider retain];
+    mCurrentSurface = nil;
+    mCurrentSurfaceIsReadyForUse = NO;
+    mSurfaces = [[NSMutableArray arrayWithCapacity:4] retain];
+    
+    return self;
+}
+
++ (CAIOSurfaceLayer*)layerWithIOSurfaceProvider:(NSObject<IOSurfaceProvider>*)provider {
+    return [[[CAIOSurfaceLayer alloc] initWithIOSurfaceProvider:provider] autorelease];
+}
+
+- (void)dealloc
 {
-    return surf_;
+    for (id surface in mSurfaces) {
+        [mIOSurfaceProvider returnSurface:surface];
+    }
+    [mSurfaces release];
+    
+    if (mCurrentSurface) {
+        [mIOSurfaceProvider returnSurface:mCurrentSurface];
+    }
+    [mCurrentSurface release];
+    
+    [mIOSurfaceProvider release];
+    
+    [super dealloc];
+}
+
+- (IOSurface*)takeNextSurfaceWithWidth:(NSInteger)width height:(NSInteger)height {
+    if (mCurrentSurface) {
+        abort();
+    }
+    
+    IOSurface* surf = [[mSurfaces firstObject] retain];
+    if (surf) {
+        // Check if we can reuse surf. If the size has changed, throw the old
+        // one out. If it is still in use (usually by the window server), keep
+        // it in the queue because it will likely become unused soon.
+        if ([surf width] != width || [surf height] != height) {
+            [mSurfaces removeObjectAtIndex:0];
+            [mIOSurfaceProvider returnSurface:surf];
+            [surf release];
+            surf = nil;
+        } else if ([surf isInUse]) {
+            [surf release];
+            surf = nil;
+        } else {
+            [mSurfaces removeObjectAtIndex:0];
+//            NSLog(@"reusing surface");
+        }
+    }
+    if (!surf) {
+//        NSLog(@"allocating new surface");
+        surf = [[mIOSurfaceProvider surfaceWithWidth:width height:height] retain];
+    }
+    if (!surf) {
+//        NSLog(@"surface allocation failed!");
+        return nil;
+    }
+    mCurrentSurface = [surf retain];
+    [mCurrentSurface incrementUseCount];
+    mCurrentSurfaceIsReadyForUse = NO;
+    [surf release];
+    surf = nil;
+    return mCurrentSurface;
+}
+
+- (void)notifySurfaceReadyForUse {
+    if (!mCurrentSurface) {
+        abort();
+    }
+    mCurrentSurfaceIsReadyForUse = YES;
+}
+
+- (BOOL)hasReadySurface {
+    return mCurrentSurface && mCurrentSurfaceIsReadyForUse;
+}
+
+- (void)display {
+//    NSLog(@"CAIOSurfaceLayer display!");
+    @synchronized(self) {
+        if (mCurrentSurface && mCurrentSurfaceIsReadyForUse) {
+            self.contents = mCurrentSurface;
+            [mSurfaces addObject:mCurrentSurface];
+            [mCurrentSurface decrementUseCount];
+            [mCurrentSurface release];
+            mCurrentSurface = nil;
+        }
+    }
 }
 
 @end
