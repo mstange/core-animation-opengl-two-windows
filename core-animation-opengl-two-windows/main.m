@@ -38,12 +38,13 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     NSOpenGLContext* glContext_;
     MOZOpenGLDrawer* glDrawer_;
     NSMutableDictionary<NSNumber*, NSDictionary<NSString*, NSNumber*>*>* mRegisteredIOSurfaces;
+    GLuint mTwoFramesAgoDoneFence;
     GLuint mPreviousFrameDoneFence;
-    GLuint mCurrentFrameDoneFence;
 }
 - (id)initWithContext:(NSOpenGLContext*)context;
 - (void)drawIntoSurface:(IOSurface*)surface;
-- (void)markFrameDoneAndApplyBackpressure:(BOOL)shouldApplyBackpressure;
+- (void)applyBackpressure;
+- (void)markFrameDone;
 @end
 
 @class IOSurface;
@@ -104,9 +105,7 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     BOOL isInMainThreadCARender_;
 }
 
-- (void)updateDrawing;
-- (BOOL)isInMainThreadCARender;
-- (void)markFrameDoneAndApplyBackpressure:(BOOL)shouldApplyBackpressure;
+- (void)doCompositeStep;
 
 @end
 
@@ -149,22 +148,25 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     [super dealloc];
 }
 
-- (void)updateDrawing
+- (void)doCompositeStep
 {
     @synchronized (self) {
-        NSSize backingSize = [self convertSizeToBacking:self.bounds.size];
+        [drawer_ applyBackpressure];
+        NSSize backingSize = [self convertSizeToBacking:self.layer.bounds.size];
         contentLayer_.surfaceSize = backingSize;
         IOSurface* surface = [contentLayer_ nextSurface];
-        if (surface) {
-            [drawer_ drawIntoSurface:surface];
-            [contentLayer_ notifySurfaceReady];
+        if (!surface) {
+            return;
+        }
+        [drawer_ drawIntoSurface:surface];
+        [contentLayer_ notifySurfaceReady];
+        [drawer_ markFrameDone];
+        if (!isInMainThreadCARender_) {
+            [CATransaction begin];
+            [self setNeedsDisplay:YES];
+            [CATransaction commit];
         }
     }
-}
-
-- (void)markFrameDoneAndApplyBackpressure:(BOOL)shouldApplyBackpressure
-{
-    [drawer_ markFrameDoneAndApplyBackpressure:shouldApplyBackpressure];
 }
 
 - (void)displayLayer:(CALayer *)layer
@@ -175,13 +177,16 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
         @synchronized (self) {
             isInMainThreadCARender_ = YES;
         }
-        [self updateDrawing];
+//        NSLog(@"main thread bounds, view: %f, %f, layer: %f, %f", self.bounds.size.width, self.bounds.size.height, layer.bounds.size.width, layer.bounds.size.height);
+        [self doCompositeStep];
         @synchronized (self) {
             isInMainThreadCARender_ = NO;
         }
+    } else {
+//        NSLog(@"compositor thread bounds, view: %f, %f, layer: %f, %f", self.bounds.size.width, self.bounds.size.height, layer.bounds.size.width, layer.bounds.size.height);
     }
     
-    contentLayer_.contentsScale = contentLayer_.surfaceSize.width / self.bounds.size.width; //self.window.backingScaleFactor;
+    contentLayer_.contentsScale = self.window.backingScaleFactor;
     [contentLayer_ setNeedsDisplay];
     [CATransaction setDisableActions:YES];
     contentLayer_.bounds = self.bounds;
@@ -189,10 +194,6 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     [CATransaction setDisableActions:NO];
     
     frameCounter_++;
-}
-
-- (BOOL)isInMainThreadCARender {
-    return isInMainThreadCARender_;
 }
 
 @end
@@ -260,25 +261,66 @@ static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTime
     [super dealloc];
 }
 
+static NSView* GetRootNSView(NSView* aView) {
+    while ([aView superview]) {
+        aView = [aView superview];
+    }
+    return aView;
+}
+
+static void DumpViewHierarchy(NSView* aView, int32_t aDepth) {
+    NSLog(@"%*s%@  frame: %@", aDepth * 4, "", aView, NSStringFromRect(aView.frame));
+    for (NSView* sv in [aView subviews]) {
+        DumpViewHierarchy(sv, aDepth + 1);
+    }
+}
+
+static NSString* trimStringAfterSubstring(NSString* whole, NSString* substring) {
+    NSRange range = [whole rangeOfString:substring];
+    if (range.location != NSNotFound) {
+        return [whole substringToIndex:range.location + 1];
+    }
+    return whole;
+}
+
+static NSString* compactDescription(id object) {
+    return trimStringAfterSubstring([object description], @">");
+}
+
+static void printCALayerSubtree(CALayer* layer, int depth) {
+    NSRect frame = [layer frame];
+    NSLog(@"%*s - %@ \"%@\" {%.1f, %.1f, %.1f, %.1f} [masksToBounds: %@, cornerRadius: %.1f, "
+          @"backgroundColor: %@, opaque: %@, view: %@, contents: %@]",
+          depth * 4, "", layer, [layer name], frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+          [layer masksToBounds] ? @"YES" : @"NO", [layer cornerRadius],
+          compactDescription((id)[layer backgroundColor]), [layer isOpaque] ? @"YES" : @"NO",
+          [layer respondsToSelector:@selector(NS_view)] ? [layer NS_view] : nil,
+          compactDescription([layer contents]));
+    for (CALayer* sublayer in [layer sublayers]) {
+        printCALayerSubtree(sublayer, depth + 1);
+    }
+}
+
+static void printCALayerHierarchy(CALayer* layer) {
+    CALayer* rootLayer = [layer presentationLayer];
+    while ([rootLayer superlayer]) {
+        rootLayer = [rootLayer superlayer];
+    }
+    printCALayerSubtree(rootLayer, 0);
+}
+
 - (void)tick
 {
     // NSLog(@"tick");
     for (MOZTestView* view in mViews) {
-        [view updateDrawing];
+        [view doCompositeStep];
+//        if (![view isInMainThreadCARender]) {
+//            [CATransaction begin];
+//            [view setNeedsDisplay:YES];
+//            [CATransaction commit];
+//        }
     }
-    for (MOZTestView* view in mViews) {
-        if (![view isInMainThreadCARender]) {
-            [CATransaction begin];
-            [view setNeedsDisplay:YES];
-            [CATransaction commit];
-//            [view.layer needsDisplay];
-        } else {
-//            NSLog(@"view is still in main thread CA render");
-        }
-    }
-    for (MOZTestView* view in mViews) {
-        [view markFrameDoneAndApplyBackpressure:YES];
-    }
+//    usleep(50 * 1000);
 }
 
 @end
@@ -323,6 +365,7 @@ main (int argc, char **argv)
     [window1 makeKeyAndOrderFront:window1];
     [window2 makeKeyAndOrderFront:window2];
     
+//    MOZCompositor* compositor = [[MOZCompositor alloc] initWithViews:@[view1]];
     MOZCompositor* compositor = [[MOZCompositor alloc] initWithViews:@[view1, view2]];
     // Compositor* compositor2 = [[Compositor alloc] initWithView:view2];
     
@@ -662,14 +705,14 @@ MakeOffscreenGLContext()
     self = [super init];
     
     mRegisteredIOSurfaces = [[NSMutableDictionary dictionaryWithCapacity:10] retain];
+    mTwoFramesAgoDoneFence = 0;
     mPreviousFrameDoneFence = 0;
-    mCurrentFrameDoneFence = 0;
     glContext_ = [context retain];
     CGLLockContext([glContext_ CGLContextObj]);
     [glContext_ makeCurrentContext];
     glDrawer_ = [[MOZOpenGLDrawer alloc] init];
+    glGenFencesAPPLE(1, &mTwoFramesAgoDoneFence);
     glGenFencesAPPLE(1, &mPreviousFrameDoneFence);
-    glGenFencesAPPLE(1, &mCurrentFrameDoneFence);
     [NSOpenGLContext clearCurrentContext];
     CGLUnlockContext([glContext_ CGLContextObj]);
     
@@ -680,8 +723,8 @@ MakeOffscreenGLContext()
 {
     CGLLockContext([glContext_ CGLContextObj]);
     [glContext_ makeCurrentContext];
+    glDeleteFencesAPPLE(1, &mTwoFramesAgoDoneFence);
     glDeleteFencesAPPLE(1, &mPreviousFrameDoneFence);
-    glDeleteFencesAPPLE(1, &mCurrentFrameDoneFence);
     // TODO: unregister iosurfaces
     [mRegisteredIOSurfaces release];
     [glDrawer_ release];
@@ -691,23 +734,29 @@ MakeOffscreenGLContext()
     [super dealloc];
 }
 
-- (void)markFrameDoneAndApplyBackpressure:(BOOL)shouldApplyBackpressure
+- (void)applyBackpressure
 {
     CGLLockContext([glContext_ CGLContextObj]);
     [glContext_ makeCurrentContext];
     
-    glSetFenceAPPLE(mCurrentFrameDoneFence);
+    glFinishFenceAPPLE(mTwoFramesAgoDoneFence);
     
-    if (shouldApplyBackpressure) {
-        glFinishFenceAPPLE(mPreviousFrameDoneFence);
-    }
+    [NSOpenGLContext clearCurrentContext];
+    CGLUnlockContext([glContext_ CGLContextObj]);
+}
+
+- (void)markFrameDone
+{
+    CGLLockContext([glContext_ CGLContextObj]);
+    [glContext_ makeCurrentContext];
     
-    // mPreviousFrameDoneFence is now status TRUE. Reuse the fence object for the next frame.
-    GLuint nextFrameDoneFence = mPreviousFrameDoneFence;
+    // Reuse the fence from two frames ago.
+    GLuint currentFrameDoneFence = mTwoFramesAgoDoneFence;
+    glSetFenceAPPLE(currentFrameDoneFence);
     
     // Prepare for the next frame.
-    mPreviousFrameDoneFence = mCurrentFrameDoneFence;
-    mCurrentFrameDoneFence = nextFrameDoneFence;
+    mTwoFramesAgoDoneFence = mPreviousFrameDoneFence;
+    mPreviousFrameDoneFence = currentFrameDoneFence;
     
     [NSOpenGLContext clearCurrentContext];
     CGLUnlockContext([glContext_ CGLContextObj]);
@@ -754,7 +803,7 @@ static float CurrentAngle() { return fmod(CFAbsoluteTimeGetCurrent(), 1.0) * 360
     [glContext_ makeCurrentContext];
     GLuint surftex = CreateTextureForIOSurface([glContext_ CGLContextObj], surf);
     GLuint surffbo = CreateFBOForTexture(surftex);
-    NSLog(@"have surf %p surftex %d surffbo %d", surf, surftex, surffbo);
+//    NSLog(@"have surf %p surftex %d surffbo %d", surf, surftex, surffbo);
     [NSOpenGLContext clearCurrentContext];
     CGLUnlockContext([glContext_ CGLContextObj]);
     
@@ -836,37 +885,47 @@ static float CurrentAngle() { return fmod(CFAbsoluteTimeGetCurrent(), 1.0) * 360
             NSLog(@"nextSurface returning nil because of invalid surfaceSize (%ld, %ld).", (long)mWidth, (long)mHeight);
             return nil;
         }
-        if (mCurrentSurface) {
-            if (!mCurrentSurfaceIsReady) {
-                NSLog(@"ERROR: Do not call nextSurface twice in sequence. Call notifySurfaceReady before the second call to nextSurface.");
-                abort();
-            }
-            // mCurrentSurface already has valid content in it that was ready to be
-            // submitted. But no CATransaction has happened since then (the layer's
-            // display method wasn't called), so we are going to throw out that content
-            // and reuse the same surface for this next draw. We don't expect a
-            // CATransaction to occur between this call to nextSurface and the next
-            // call to notifySurfaceIsReadyForUse, usually.
-            mCurrentSurfaceIsReady = NO;
-            return mCurrentSurface;
+        if (mCurrentSurface && !mCurrentSurfaceIsReady) {
+            NSLog(@"ERROR: Do not call nextSurface twice in sequence. Call notifySurfaceReady before the second call to nextSurface.");
+            abort();
         }
         
-        IOSurface* surf = [[mSurfaces firstObject] retain];
+        IOSurface* surf = nil;
+        if (mCurrentSurface) {
+            // mCurrentSurface already has valid content in it that was ready to be
+            // submitted. But no CATransaction has happened since the time it became
+            // ready and now (the layer's display method wasn't called), so we are going
+            // to throw out that content and reuse the same surface for this next draw.
+            // There's one reason we could have for choosing to keep mCurrentSurface's
+            // existing content around: If a CATransaction were to happen between this
+            // call to nextSurface and the upcoming call to notifySurfaceReady, then
+            // we could submit the surface with the existing content, because the new
+            // content wouldn't be ready yet. But usually, such a sequence of events will
+            // not happen; our callers will usually trigger CATransactions *after*
+            // calling notifySurfaceReady. So the existing content will not make it to the
+            // screen anyway, and reusing mCurrentSurface is the right choice.
+//            NSLog(@"discarding mCurrentSurface content");
+            surf = [mCurrentSurface retain];
+            [mCurrentSurface decrementUseCount];
+            [mCurrentSurface release];
+            mCurrentSurface = nil;
+        } else if ([mSurfaces count] != 0) {
+            surf = [[mSurfaces firstObject] retain];
+            [mSurfaces removeObjectAtIndex:0];
+        }
         if (surf) {
-            // Check if we can reuse surf. If the size has changed, throw the old
-            // one out. If it has the right size but is still in use (usually by
-            // the window server), keep it in the queue because it will likely become
+            // Check if we can reuse surf. If the size has changed, throw surf out.
+            // If it has the right size but is still in use (usually by the window
+            // server), put it back into the queue because it will likely become
             // unused soon.
             if ([surf width] != mWidth || [surf height] != mHeight) {
-                [mSurfaces removeObjectAtIndex:0];
                 [mIOSurfaceProvider returnSurface:surf];
                 [surf release];
                 surf = nil;
             } else if ([surf isInUse]) {
+                [mSurfaces insertObject:surf atIndex:0];
                 [surf release];
                 surf = nil;
-            } else {
-                [mSurfaces removeObjectAtIndex:0];
             }
         }
         if (!surf) {
@@ -880,6 +939,7 @@ static float CurrentAngle() { return fmod(CFAbsoluteTimeGetCurrent(), 1.0) * 360
         mCurrentSurfaceIsReady = NO;
         [surf release];
         surf = nil;
+//        NSLog(@"drawing to surface of size %d x %d", (int)[mCurrentSurface width], (int)[mCurrentSurface height]);
         return mCurrentSurface;
     }
 }
@@ -896,12 +956,15 @@ static float CurrentAngle() { return fmod(CFAbsoluteTimeGetCurrent(), 1.0) * 360
 - (void)display {
     @synchronized(self) {
         if (mCurrentSurface && mCurrentSurfaceIsReady) {
+//            NSLog(@"submitting surface of size %d x %d", (int)[mCurrentSurface width], (int)[mCurrentSurface height]);
+            [CATransaction setDisableActions:YES];
             self.contents = mCurrentSurface;
             [mSurfaces addObject:mCurrentSurface];
             [mCurrentSurface decrementUseCount];
             [mCurrentSurface release];
             mCurrentSurface = nil;
         }
+//        printCALayerHierarchy(self);
     }
 }
 
