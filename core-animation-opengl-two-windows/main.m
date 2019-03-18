@@ -48,7 +48,7 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
 
 @class IOSurface;
 
-// A CAIOSurfaceLayer is CALayer subclass which wraps a "swapchain" of IOSurfaces.
+// A MOZIOSurfaceCALayer is CALayer subclass which wraps a "swapchain" of IOSurfaces.
 // It supports setting an opaque region and it keeps track of invalid areas
 // within the surfaces.
 // Internally, it is assembled of one or more sublayers, depending on the
@@ -59,7 +59,7 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
 @interface MOZIOSurfaceCALayer : CALayer {
     NSObject<MOZIOSurfaceProvider>* mIOSurfaceProvider; // [strong]
     
-    // The surface we returned from the most recent call to takeNextSurface.
+    // The surface we returned from the most recent call to nextSurface.
     // Can be null if notifySurfaceReady has been called.
     IOSurface* mCurrentSurface; // [strong]
     
@@ -68,7 +68,7 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     BOOL mCurrentSurfaceIsReady;
     
     // Really, it's a state machine:
-    // NoCurrentSurface -[takeNextSurface]-> CurrentSurfaceButNotReady
+    // NoCurrentSurface -[nextSurface]-> CurrentSurfaceButNotReady
     // -[notifySurfaceReady]-> CurrentSurfaceReady -[display]-> NoCurrentSurface
     
     // The queue of surfaces which make up our "swap chain".
@@ -87,7 +87,7 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
 @property (retain) NSObject<MOZIOSurfaceProvider>* surfaceProvider;
 @property CGSize surfaceSize;
 // - (void)invalidateRectThroughoutSwapchain:(NSRect)aRect;
-- (IOSurface*)takeNextSurface;
+- (IOSurface*)nextSurface;
 // - (NSRect)currentSurfaceInvalidRect;
 // - (NSRect)opaqueRect;
 - (void)notifySurfaceReady;
@@ -101,9 +101,11 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     MOZIOSurfaceContentsDrawerUsingOpenGL* drawer_;
     uint64_t frameCounter_;
     MOZIOSurfaceCALayer* contentLayer_;
+    BOOL isInMainThreadCARender_;
 }
 
 - (void)updateDrawing;
+- (BOOL)isInMainThreadCARender;
 - (void)markFrameDoneAndApplyBackpressure:(BOOL)shouldApplyBackpressure;
 
 @end
@@ -152,7 +154,7 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     @synchronized (self) {
         NSSize backingSize = [self convertSizeToBacking:self.bounds.size];
         contentLayer_.surfaceSize = backingSize;
-        IOSurface* surface = [contentLayer_ takeNextSurface];
+        IOSurface* surface = [contentLayer_ nextSurface];
         if (surface) {
             [drawer_ drawIntoSurface:surface];
             [contentLayer_ notifySurfaceReady];
@@ -167,7 +169,19 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
 
 - (void)displayLayer:(CALayer *)layer
 {
-    //     NSLog(@"updateLayer in window %@", [self window]);
+//    NSLog(@"displayLayer in window %@", [self window]);
+
+    if ([NSThread isMainThread]) {
+        @synchronized (self) {
+            isInMainThreadCARender_ = YES;
+        }
+        [self updateDrawing];
+        @synchronized (self) {
+            isInMainThreadCARender_ = NO;
+        }
+    }
+    
+    contentLayer_.contentsScale = contentLayer_.surfaceSize.width / self.bounds.size.width; //self.window.backingScaleFactor;
     [contentLayer_ setNeedsDisplay];
     [CATransaction setDisableActions:YES];
     contentLayer_.bounds = self.bounds;
@@ -175,6 +189,10 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     [CATransaction setDisableActions:NO];
     
     frameCounter_++;
+}
+
+- (BOOL)isInMainThreadCARender {
+    return isInMainThreadCARender_;
 }
 
 @end
@@ -249,9 +267,14 @@ static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTime
         [view updateDrawing];
     }
     for (MOZTestView* view in mViews) {
-        [CATransaction begin];
-        [view setNeedsDisplay:YES];
-        [CATransaction commit];
+        if (![view isInMainThreadCARender]) {
+            [CATransaction begin];
+            [view setNeedsDisplay:YES];
+            [CATransaction commit];
+//            [view.layer needsDisplay];
+        } else {
+//            NSLog(@"view is still in main thread CA render");
+        }
     }
     for (MOZTestView* view in mViews) {
         [view markFrameDoneAndApplyBackpressure:YES];
@@ -802,27 +825,27 @@ static float CurrentAngle() { return fmod(CFAbsoluteTimeGetCurrent(), 1.0) * 360
     }
 }
 
-- (IOSurface*)takeNextSurface {
+- (IOSurface*)nextSurface {
     @synchronized (self) {
         if (!mIOSurfaceProvider) {
-            NSLog(@"takeNextSurface returning nil because no surfaceProvider has been assigned.");
+            NSLog(@"nextSurface returning nil because no surfaceProvider has been assigned.");
             return nil;
         }
         [self _recomputeSizeIfNotAssigned];
         if (mWidth <= 0 || mHeight <= 0) {
-            NSLog(@"takeNextSurface returning nil because of invalid surfaceSize (%ld, %ld).", (long)mWidth, (long)mHeight);
+            NSLog(@"nextSurface returning nil because of invalid surfaceSize (%ld, %ld).", (long)mWidth, (long)mHeight);
             return nil;
         }
         if (mCurrentSurface) {
             if (!mCurrentSurfaceIsReady) {
-                NSLog(@"ERROR: Do not call takeNextSurface twice in sequence. Call notifySurfaceReady before the second call to takeNextSurface.");
+                NSLog(@"ERROR: Do not call nextSurface twice in sequence. Call notifySurfaceReady before the second call to nextSurface.");
                 abort();
             }
             // mCurrentSurface already has valid content in it that was ready to be
             // submitted. But no CATransaction has happened since then (the layer's
             // display method wasn't called), so we are going to throw out that content
             // and reuse the same surface for this next draw. We don't expect a
-            // CATransaction to occur between this call to takeNextSurface and the next
+            // CATransaction to occur between this call to nextSurface and the next
             // call to notifySurfaceIsReadyForUse, usually.
             mCurrentSurfaceIsReady = NO;
             return mCurrentSurface;
