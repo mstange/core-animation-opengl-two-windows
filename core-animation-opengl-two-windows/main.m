@@ -9,7 +9,7 @@
 
 static NSOpenGLContext* MakeOffscreenGLContext(void);
 
-@interface OpenGLDrawer : NSObject
+@interface MOZOpenGLDrawer : NSObject
 {
     GLuint programID_;
     GLuint texture_;
@@ -28,15 +28,15 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
 
 @end
 
-@protocol IOSurfaceProvider
+@protocol MOZIOSurfaceProvider
 - (IOSurface*)surfaceWithWidth:(NSInteger)width height:(NSInteger)height;
 - (void)returnSurface:(IOSurface*)surface;
 @end
 
-@interface IOSurfaceContentsDrawerUsingOpenGL : NSObject<IOSurfaceProvider>
+@interface MOZIOSurfaceContentsDrawerUsingOpenGL : NSObject<MOZIOSurfaceProvider>
 {
     NSOpenGLContext* glContext_;
-    OpenGLDrawer* glDrawer_;
+    MOZOpenGLDrawer* glDrawer_;
     NSMutableDictionary<NSNumber*, NSDictionary<NSString*, NSNumber*>*>* mRegisteredIOSurfaces;
     GLuint mPreviousFrameDoneFence;
     GLuint mCurrentFrameDoneFence;
@@ -56,42 +56,51 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
 // so CASurfaceLayer creates layers for the opaque and transparent rectangles
 // that together form the full layer. All sublayers share the same IOSurface.
 // Submitting a new frame updates all sublayers.
-@interface CAIOSurfaceLayer : CALayer {
-    NSObject<IOSurfaceProvider>* mIOSurfaceProvider; // [strong]
+@interface MOZIOSurfaceCALayer : CALayer {
+    NSObject<MOZIOSurfaceProvider>* mIOSurfaceProvider; // [strong]
     
-    // The surface we returned from the most recent call to takeNextSurfaceWithWidth:height.
-    // Can be null if notifySurfaceReadyForUse has been called.
+    // The surface we returned from the most recent call to takeNextSurface.
+    // Can be null if notifySurfaceReady has been called.
     IOSurface* mCurrentSurface; // [strong]
     
     // Whether we're ready to submit mCurrentSurface during the next call to
     // display. Meaningless as long as mCurrentSurface is null.
-    BOOL mCurrentSurfaceIsReadyForUse;
+    BOOL mCurrentSurfaceIsReady;
     
     // Really, it's a state machine:
     // NoCurrentSurface -[takeNextSurface]-> CurrentSurfaceButNotReady
-    // -[notifySurfaceReadyForUse]-> CurrentSurfaceReady -[display]-> NoCurrentSurface
+    // -[notifySurfaceReady]-> CurrentSurfaceReady -[display]-> NoCurrentSurface
     
     // The queue of surfaces which make up our "swap chain".
     // [mSurfaces firstObject] is the next surface we'll attempt to use.
     // [mSurfaces lastObject] is the one we submitted most recently.
     NSMutableArray<IOSurface*>* mSurfaces; // [strong]
+
+    NSInteger mWidth;
+    NSInteger mHeight;
+    
+    BOOL mHaveAssignedSurfaceSize;
 }
 
-- (id)initWithIOSurfaceProvider:(NSObject<IOSurfaceProvider>*)provider;
-+ (CAIOSurfaceLayer*)layerWithIOSurfaceProvider:(NSObject<IOSurfaceProvider>*)provider;
+- (id)init;
++ (MOZIOSurfaceCALayer*)layer;
+@property (retain) NSObject<MOZIOSurfaceProvider>* surfaceProvider;
+@property CGSize surfaceSize;
 // - (void)invalidateRectThroughoutSwapchain:(NSRect)aRect;
-- (IOSurface*)takeNextSurfaceWithWidth:(NSInteger)width height:(NSInteger)height;
+- (IOSurface*)takeNextSurface;
 // - (NSRect)currentSurfaceInvalidRect;
 // - (NSRect)opaqueRect;
-- (void)notifySurfaceReadyForUse;
+- (void)notifySurfaceReady;
+
+- (void)_recomputeSizeIfNotAssigned;
 
 @end
 
-@interface TestView: NSView<CALayerDelegate>
+@interface MOZTestView: NSView<CALayerDelegate>
 {
-    IOSurfaceContentsDrawerUsingOpenGL* drawer_;
+    MOZIOSurfaceContentsDrawerUsingOpenGL* drawer_;
     uint64_t frameCounter_;
-    CAIOSurfaceLayer* contentLayer_;
+    MOZIOSurfaceCALayer* contentLayer_;
 }
 
 - (void)updateDrawing;
@@ -99,7 +108,7 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
 
 @end
 
-@implementation TestView
+@implementation MOZTestView
 
 - (id)initWithFrame:(NSRect)aFrame
 {
@@ -112,9 +121,10 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
     self.layer.delegate = self;
     self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawDuringViewResize;
     
-    drawer_ = [[IOSurfaceContentsDrawerUsingOpenGL alloc] initWithContext:MakeOffscreenGLContext()];
+    drawer_ = [[MOZIOSurfaceContentsDrawerUsingOpenGL alloc] initWithContext:MakeOffscreenGLContext()];
     
-    contentLayer_ = [[CAIOSurfaceLayer layerWithIOSurfaceProvider:drawer_] retain];
+    contentLayer_ = [[MOZIOSurfaceCALayer layer] retain];
+    contentLayer_.surfaceProvider = drawer_;
     contentLayer_.position = NSZeroPoint;
     contentLayer_.anchorPoint = NSZeroPoint;
     contentLayer_.bounds = self.bounds;
@@ -141,9 +151,12 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
 {
     @synchronized (self) {
         NSSize backingSize = [self convertSizeToBacking:self.bounds.size];
-        IOSurface* surface = [contentLayer_ takeNextSurfaceWithWidth:(int)backingSize.width height:(int)backingSize.height];
-        [drawer_ drawIntoSurface:surface];
-        [contentLayer_ notifySurfaceReadyForUse];
+        contentLayer_.surfaceSize = backingSize;
+        IOSurface* surface = [contentLayer_ takeNextSurface];
+        if (surface) {
+            [drawer_ drawIntoSurface:surface];
+            [contentLayer_ notifySurfaceReady];
+        }
     }
 }
 
@@ -166,10 +179,10 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
 
 @end
 
-@interface TerminateOnClose : NSObject<NSWindowDelegate>
+@interface MOZTerminateOnCloseDelegate : NSObject<NSWindowDelegate>
 @end
 
-@implementation TerminateOnClose
+@implementation MOZTerminateOnCloseDelegate
 - (void)windowWillClose:(NSNotification*)notification
 {
     [NSApp terminate:self];
@@ -180,12 +193,12 @@ static NSOpenGLContext* MakeOffscreenGLContext(void);
 }
 @end
 
-@interface Compositor : NSObject
+@interface MOZCompositor : NSObject
 {
-    NSArray<TestView*>* mViews;
+    NSArray<MOZTestView*>* mViews;
     CVDisplayLinkRef mDisplayLink;
 }
-- (id)initWithViews:(NSArray<TestView*>*)views;
+- (id)initWithViews:(NSArray<MOZTestView*>*)views;
 - (void)tick;
 @end
 
@@ -193,13 +206,13 @@ static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTime
                                       const CVTimeStamp* outputTime, CVOptionFlags flagsIn,
                                       CVOptionFlags* flagsOut, void* displayLinkContext)
 {
-    [(Compositor*)displayLinkContext tick];
+    [(MOZCompositor*)displayLinkContext tick];
     return kCVReturnSuccess;
 }
 
-@implementation Compositor
+@implementation MOZCompositor
 
-- (id)initWithViews:(NSArray<TestView*>*)views
+- (id)initWithViews:(NSArray<MOZTestView*>*)views
 {
     self = [super init];
     mViews = [views retain];
@@ -232,15 +245,15 @@ static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTime
 - (void)tick
 {
     // NSLog(@"tick");
-    for (TestView* view in mViews) {
+    for (MOZTestView* view in mViews) {
         [view updateDrawing];
     }
-    for (TestView* view in mViews) {
+    for (MOZTestView* view in mViews) {
         [CATransaction begin];
         [view setNeedsDisplay:YES];
         [CATransaction commit];
     }
-    for (TestView* view in mViews) {
+    for (MOZTestView* view in mViews) {
         [view markFrameDoneAndApplyBackpressure:YES];
     }
 }
@@ -263,12 +276,12 @@ main (int argc, char **argv)
                                                       backing:NSBackingStoreBuffered
                                                         defer:NO];
     
-    TestView* view1 = [[TestView alloc] initWithFrame:NSMakeRect(0, 0, contentRect1.size.width, contentRect1.size.height)];
+    MOZTestView* view1 = [[MOZTestView alloc] initWithFrame:NSMakeRect(0, 0, contentRect1.size.width, contentRect1.size.height)];
     [view1 setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     
     [window1 contentView].wantsLayer = YES;
     [[window1 contentView] addSubview:view1];
-    [window1 setDelegate:[[TerminateOnClose alloc] autorelease]];
+    [window1 setDelegate:[[MOZTerminateOnCloseDelegate alloc] autorelease]];
     
     NSRect contentRect2 = NSMakeRect(400, 200, 800, 500);
     NSWindow* window2 = [[NSWindow alloc] initWithContentRect:contentRect2
@@ -276,18 +289,18 @@ main (int argc, char **argv)
                                                       backing:NSBackingStoreBuffered
                                                         defer:NO];
     
-    TestView* view2 = [[TestView alloc] initWithFrame:NSMakeRect(0, 0, contentRect2.size.width, contentRect2.size.height)];
+    MOZTestView* view2 = [[MOZTestView alloc] initWithFrame:NSMakeRect(0, 0, contentRect2.size.width, contentRect2.size.height)];
     [view2 setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     
     [window2 contentView].wantsLayer = YES;
     [[window2 contentView] addSubview:view2];
-    [window2 setDelegate:[[TerminateOnClose alloc] autorelease]];
+    [window2 setDelegate:[[MOZTerminateOnCloseDelegate alloc] autorelease]];
     
     [NSApp activateIgnoringOtherApps:YES];
     [window1 makeKeyAndOrderFront:window1];
     [window2 makeKeyAndOrderFront:window2];
     
-    Compositor* compositor = [[Compositor alloc] initWithViews:@[view1, view2]];
+    MOZCompositor* compositor = [[MOZCompositor alloc] initWithViews:@[view1, view2]];
     // Compositor* compositor2 = [[Compositor alloc] initWithView:view2];
     
     
@@ -343,7 +356,7 @@ static const char* kFragmentShader =
 "  gl_FragColor = vColorMat * texture2D(uSampler, vPos);\n"
 "}\n";
 
-@implementation OpenGLDrawer
+@implementation MOZOpenGLDrawer
 
 - (instancetype)init
 {
@@ -619,7 +632,7 @@ MakeOffscreenGLContext()
     return [ctx autorelease];
 }
 
-@implementation IOSurfaceContentsDrawerUsingOpenGL
+@implementation MOZIOSurfaceContentsDrawerUsingOpenGL
 
 - (id)initWithContext:(NSOpenGLContext*)context
 {
@@ -631,7 +644,7 @@ MakeOffscreenGLContext()
     glContext_ = [context retain];
     CGLLockContext([glContext_ CGLContextObj]);
     [glContext_ makeCurrentContext];
-    glDrawer_ = [[OpenGLDrawer alloc] init];
+    glDrawer_ = [[MOZOpenGLDrawer alloc] init];
     glGenFencesAPPLE(1, &mPreviousFrameDoneFence);
     glGenFencesAPPLE(1, &mCurrentFrameDoneFence);
     [NSOpenGLContext clearCurrentContext];
@@ -730,21 +743,24 @@ static float CurrentAngle() { return fmod(CFAbsoluteTimeGetCurrent(), 1.0) * 360
 @end
 
 
-@implementation CAIOSurfaceLayer
+@implementation MOZIOSurfaceCALayer
 
-- (id)initWithIOSurfaceProvider:(NSObject<IOSurfaceProvider>*)provider {
+- (id)init {
     self = [super init];
     
-    mIOSurfaceProvider = [provider retain];
+    mIOSurfaceProvider = nil;
     mCurrentSurface = nil;
-    mCurrentSurfaceIsReadyForUse = NO;
+    mCurrentSurfaceIsReady = NO;
     mSurfaces = [[NSMutableArray arrayWithCapacity:4] retain];
+    mWidth = 0;
+    mHeight = 0;
+    mHaveAssignedSurfaceSize = NO;
     
     return self;
 }
 
-+ (CAIOSurfaceLayer*)layerWithIOSurfaceProvider:(NSObject<IOSurfaceProvider>*)provider {
-    return [[[CAIOSurfaceLayer alloc] initWithIOSurfaceProvider:provider] autorelease];
++ (MOZIOSurfaceCALayer*)layer {
+    return [[[MOZIOSurfaceCALayer alloc] init] autorelease];
 }
 
 - (void)dealloc
@@ -764,19 +780,61 @@ static float CurrentAngle() { return fmod(CFAbsoluteTimeGetCurrent(), 1.0) * 360
     [super dealloc];
 }
 
-- (IOSurface*)takeNextSurfaceWithWidth:(NSInteger)width height:(NSInteger)height {
+@synthesize surfaceProvider = mIOSurfaceProvider;
+
+- (void)setSurfaceSize:(CGSize)size {
     @synchronized (self) {
+        mWidth = (NSInteger)size.width;
+        mHeight = (NSInteger)size.height;
+        mHaveAssignedSurfaceSize = YES;
+    }
+}
+
+- (CGSize)surfaceSize {
+    return CGSizeMake(mWidth, mHeight);
+}
+
+- (void)_recomputeSizeIfNotAssigned
+{
+    if (!mHaveAssignedSurfaceSize) {
+        mWidth = (NSInteger)(self.bounds.size.width * self.contentsScale);
+        mHeight = (NSInteger)(self.bounds.size.height * self.contentsScale);
+    }
+}
+
+- (IOSurface*)takeNextSurface {
+    @synchronized (self) {
+        if (!mIOSurfaceProvider) {
+            NSLog(@"takeNextSurface returning nil because no surfaceProvider has been assigned.");
+            return nil;
+        }
+        [self _recomputeSizeIfNotAssigned];
+        if (mWidth <= 0 || mHeight <= 0) {
+            NSLog(@"takeNextSurface returning nil because of invalid surfaceSize (%ld, %ld).", (long)mWidth, (long)mHeight);
+            return nil;
+        }
         if (mCurrentSurface) {
-            NSLog(@"ERROR: surface already in use. Please trigger a CATransaction before taking the next one.");
-            abort();
+            if (!mCurrentSurfaceIsReady) {
+                NSLog(@"ERROR: Do not call takeNextSurface twice in sequence. Call notifySurfaceReady before the second call to takeNextSurface.");
+                abort();
+            }
+            // mCurrentSurface already has valid content in it that was ready to be
+            // submitted. But no CATransaction has happened since then (the layer's
+            // display method wasn't called), so we are going to throw out that content
+            // and reuse the same surface for this next draw. We don't expect a
+            // CATransaction to occur between this call to takeNextSurface and the next
+            // call to notifySurfaceIsReadyForUse, usually.
+            mCurrentSurfaceIsReady = NO;
+            return mCurrentSurface;
         }
         
         IOSurface* surf = [[mSurfaces firstObject] retain];
         if (surf) {
             // Check if we can reuse surf. If the size has changed, throw the old
-            // one out. If it is still in use (usually by the window server), keep
-            // it in the queue because it will likely become unused soon.
-            if ([surf width] != width || [surf height] != height) {
+            // one out. If it has the right size but is still in use (usually by
+            // the window server), keep it in the queue because it will likely become
+            // unused soon.
+            if ([surf width] != mWidth || [surf height] != mHeight) {
                 [mSurfaces removeObjectAtIndex:0];
                 [mIOSurfaceProvider returnSurface:surf];
                 [surf release];
@@ -786,39 +844,35 @@ static float CurrentAngle() { return fmod(CFAbsoluteTimeGetCurrent(), 1.0) * 360
                 surf = nil;
             } else {
                 [mSurfaces removeObjectAtIndex:0];
-    //            NSLog(@"reusing surface");
             }
         }
         if (!surf) {
-    //        NSLog(@"allocating new surface");
-            surf = [[mIOSurfaceProvider surfaceWithWidth:width height:height] retain];
+            surf = [[mIOSurfaceProvider surfaceWithWidth:mWidth height:mHeight] retain];
         }
         if (!surf) {
-    //        NSLog(@"surface allocation failed!");
             return nil;
         }
         mCurrentSurface = [surf retain];
         [mCurrentSurface incrementUseCount];
-        mCurrentSurfaceIsReadyForUse = NO;
+        mCurrentSurfaceIsReady = NO;
         [surf release];
         surf = nil;
         return mCurrentSurface;
     }
 }
 
-- (void)notifySurfaceReadyForUse {
+- (void)notifySurfaceReady {
     @synchronized (self) {
         if (!mCurrentSurface) {
             abort();
         }
-        mCurrentSurfaceIsReadyForUse = YES;
+        mCurrentSurfaceIsReady = YES;
     }
 }
 
 - (void)display {
-//    NSLog(@"CAIOSurfaceLayer display!");
     @synchronized(self) {
-        if (mCurrentSurface && mCurrentSurfaceIsReadyForUse) {
+        if (mCurrentSurface && mCurrentSurfaceIsReady) {
             self.contents = mCurrentSurface;
             [mSurfaces addObject:mCurrentSurface];
             [mCurrentSurface decrementUseCount];
